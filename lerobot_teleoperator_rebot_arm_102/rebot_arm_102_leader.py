@@ -2,7 +2,7 @@ import logging
 import time
 from typing import Any, Tuple
 
-from motorbridge_smart_servo import FashionStarServo, ServoMonitor, ServoBusError
+from motorbridge_smart_servo import FashionStarServo, ServoBusError
 from lerobot.motors import MotorCalibration
 from lerobot.processor import RobotAction
 from lerobot.teleoperators.teleoperator import Teleoperator
@@ -137,17 +137,36 @@ class RebotArm102Leader(Teleoperator):
             self.bus.reset_multi_turn(motor_id)
 
     def _read_raw_positions(self) -> dict[str, float]:
-        result: dict[int, ServoMonitor | None] = self.bus.sync_monitor(
-            list(self.config.joint_ids.values())
-        )
-        id_to_name = {v: k for k, v in self.config.joint_ids.items()}
-        raw_positions: dict[str, float] = {}
-        for motor_id, m in result.items():
-            motor_name = id_to_name[motor_id]
-            if m is None:
-                raise RuntimeError(f"Servo {motor_name} (id={motor_id}) has never responded.")
-            raw_positions[motor_name] = m.angle_deg
-        return raw_positions
+        """Read every joint angle with the SDK's near-zero filter bypassed.
+
+        sync_monitor() cannot be used here. ServoMonitor carries only the
+        *filtered* angle, and the SDK holds that at the last good value for 30
+        consecutive reads whenever |angle| <= 0.2 deg (zero_eps_deg /
+        zero_confirm_samples, smart_servo_core/src/reliability.rs at 0.0.4) --
+        which is exactly where a joint resting on its calibrated origin sits.
+        One sync command for 7 ids also loses a reply most of the time and then
+        blocks for the bus's 100 ms timeout, capping the loop at ~9.5 Hz.
+
+        read_angle() exposes raw_deg, the angle straight from the servo packet,
+        and one command per servo never waits on a reply that is not coming:
+        ~17.6 ms for all seven (~56 Hz).
+
+        The catch: on a timeout the SDK does not raise, it fabricates
+        AngleSample(raw_deg=0.0, filtered_deg=last_good, reliable=False) in
+        filter_timeout_sample() (fashionstar/src/controller.rs:204), so taking
+        raw_deg blindly would command a jump to zero. A genuine near-zero
+        reading is also |raw| <= 0.2, so the two are separable only by raw_deg
+        being exactly 0.0; preferring filtered_deg in that one case costs at
+        most 0.2 deg of staleness on a joint sitting precisely on its origin,
+        and never invents a jump. A servo that misses 20 consecutive replies
+        still raises ServoBusError, which get_action() already handles.
+        """
+        positions: dict[str, float] = {}
+        for motor_name, motor_id in self.config.joint_ids.items():
+            sample = self.bus.read_angle(motor_id, multi_turn=True)
+            timed_out = not sample.reliable and sample.raw_deg == 0.0
+            positions[motor_name] = sample.filtered_deg if timed_out else sample.raw_deg
+        return positions
 
     @staticmethod
     def _clamp(value: float, min_value: float, max_value: float) -> float:
